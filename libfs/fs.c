@@ -1,0 +1,225 @@
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+
+#include "disk.h"
+#include "fs.h"
+
+#define SIGNATURE "ECS150FS" //signature for the file system we want
+#define SIGNATURE_LENGTH 8 
+#define FAT_EOC 0XFFFF //marks end of block chain (FAT)
+
+typedef struct superblock_tag{ //struct for the first block 
+	uint8_t signature[SIGNATURE_LENGTH];
+	uint16_t total_blocks;
+	uint16_t root_index;
+	uint16_t data_block_index;
+	uint16_t data_block_amount;
+	uint8_t fat_block_count;
+	uint8_t padding[4079];
+}__attribute__((packed)) superblock_t; //packed so there's no padding between the variables of the struct
+
+typedef struct root_dir_tag{ //struct for each entry in root directory
+	char filename[FS_FILENAME_LEN];
+	uint32_t size;
+	uint16_t first_block_index;
+	uint8_t padding[10];
+}__attribute__((packed)) root_dir_entry_t; 
+
+static superblock_t superblock;
+static root_dir_entry_t *root_dir = NULL; 
+static uint16_t *fat = NULL;
+
+/* TODO: Phase 1 */
+
+int fs_mount(const char *diskname)
+{
+	/* TODO: Phase 1 */
+	if(block_disk_open(diskname) == -1){ //we try to open the disk
+		return(-1); //if we can't open it
+	}
+	if(block_read(0, &superblock) == -1){ //reading the superblock from disk into the superblock struct 
+		block_disk_close();
+		return(-1); //if we can't read it
+	}
+	if(memcmp(superblock.signature, SIGNATURE, SIGNATURE_LENGTH) != 0){ //checking if signature matches what we want (ECS150FS)
+		block_disk_close();
+		return(-1);
+	}
+	int block_count = block_disk_count();//getting the actual number of blocks 
+	if(block_count == -1){
+		block_disk_close();
+		return(-1); //if we can't get the block count
+	}
+	if(block_count != superblock.total_blocks){ //checking that the superblock's total blocks matches the actual disk size 
+		block_disk_close();
+		return(-1);
+	}
+
+	uint8_t expected_fat_block_count = ((superblock.data_block_amount * 2) + (BLOCK_SIZE -1))/BLOCK_SIZE; //calculating how mmany blocks FAT should occupy 
+
+	if(expected_fat_block_count != superblock.fat_block_count){
+		block_disk_close();
+		return(-1); //if the FAT size isn't right
+	}
+	if(superblock.root_index != superblock.fat_block_count+1){ //checking that the root directory is right after the FAT blocks
+		block_disk_close();
+		return(-1); //if it's not
+	}
+	if(superblock.data_block_index != superblock.root_index+1){
+		block_disk_close();
+		return(-1);
+	}
+	fat = (uint16_t *)calloc(superblock.data_block_amount, sizeof(uint16_t)); //allocating memory for FAT (using calloc to initialize to 0)
+	if(fat == NULL){
+		block_disk_close();
+		return(-1);
+	}
+	
+	uint8_t *fat_buffer = calloc(superblock.fat_block_count, BLOCK_SIZE); //allocating temporary buffer to read all FAT blocks
+    if(fat_buffer == NULL){
+        block_disk_close();
+        free(fat);
+        fat = NULL;
+        return(-1);
+    }
+
+	for(int i = 0; i < superblock.fat_block_count; i++){ //read FAT blocks into the buffer
+		if(block_read(i+1, fat_buffer +(i * BLOCK_SIZE)) == -1){ 
+			block_disk_close();
+			free(fat);
+			free(fat_buffer);
+			fat = NULL; 
+			return(-1);
+		}
+
+	
+	}
+
+	memcpy(fat, fat_buffer, superblock.data_block_amount * sizeof(uint16_t)); //copy the FAT data from the temporary buffer into the actual FAT
+    free(fat_buffer);
+	if(fat[0] != (uint16_t) FAT_EOC){ //checking that first entry is set to FAT_EOC
+		block_disk_close();
+		free(fat);
+		fat = NULL;
+		return(-1);
+	}
+	
+	root_dir = (root_dir_entry_t *)calloc(FS_FILE_MAX_COUNT, sizeof(root_dir_entry_t)); 
+	if(root_dir == NULL){
+		block_disk_close();
+		free(fat);
+		fat = NULL;
+		return(-1);
+	}
+	if(block_read(superblock.root_index, root_dir) == -1){
+		block_disk_close();
+		free(fat);
+		fat = NULL; 
+		free(root_dir);
+		root_dir = NULL;
+		return(-1);
+	}
+
+
+	return 0;
+}
+
+int fs_umount(void)
+{
+	/* TODO: Phase 1 */
+	free(fat);
+	free(root_dir);
+	fat = NULL; 
+	root_dir = NULL; 
+	if(block_disk_close() == -1){
+		return(-1);
+	}
+	return 0;
+}
+
+int fs_info(void)
+{
+	/* TODO: Phase 1 */
+	if(fat == NULL){
+		return(-1);
+	}
+	int fat_free_blocks = 0; //counting how many blocks are available
+	for(int i=1; i < superblock.data_block_amount; i++){ //skipping index 0 since it's always FAT_EOC 
+		if(fat[i] == 0){
+			fat_free_blocks++;
+		}
+	}
+
+	int rdir_free_entries = 0;//counting how many root directory entries are available
+	for(int i=0; i < FS_FILE_MAX_COUNT; i++){
+		if(root_dir[i].filename[0] == '\0'){
+			rdir_free_entries++;
+		}
+	}
+
+	printf("FS Info:\n");
+	printf("total_blk_count=%u\n", superblock.total_blocks);
+	printf("fat_blk_count=%u\n", superblock.fat_block_count);
+	printf("rdir_blk=%u\n", superblock.root_index);
+	printf("data_blk=%u\n", superblock.data_block_index);
+	printf("data_blk_count=%u\n", superblock.data_block_amount);
+	printf("fat_free_ratio=%d/%u\n", fat_free_blocks, superblock.data_block_amount);
+	printf("rdir_free_ratio=%d/%d\n", rdir_free_entries, FS_FILE_MAX_COUNT);
+
+	return 0;
+}
+
+int fs_create(const char *filename)
+{
+	/* TODO: Phase 2 */
+}
+
+int fs_delete(const char *filename)
+{
+	/* TODO: Phase 2 */
+}
+
+int fs_ls(void)
+{
+	/* TODO: Phase 2 */
+}
+
+int fs_open(const char *filename)
+{
+	/* TODO: Phase 3 */
+}
+
+int fs_close(int fd)
+{
+	/* TODO: Phase 3 */
+}
+
+int fs_stat(int fd)
+{
+	/* TODO: Phase 3 */
+}
+
+int fs_lseek(int fd, size_t offset)
+{
+	/* TODO: Phase 3 */
+}
+
+int fs_write(int fd, void *buf, size_t count)
+{
+	/* TODO: Phase 4 */
+}
+
+int fs_read(int fd, void *buf, size_t count)
+{
+	/* TODO: Phase 4 */
+}
+
+
+/*Sources
+https://www.gnu.org/software/libc/manual/html_node/Integers.html
+https://www.geeksforgeeks.org/dynamic-memory-allocation-in-c-using-malloc-calloc-free-and-realloc/
+https://gcc.gnu.org/onlinedocs/gcc-4.1.0/gcc/Type-Attributes.html
+*/
