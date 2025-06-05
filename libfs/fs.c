@@ -122,6 +122,7 @@ int fs_mount(const char *diskname)
 		free(root_dir);
 		root_dir = NULL;
 		return(-1);
+
 	}
 	mounted = 1;
 
@@ -135,7 +136,6 @@ int fs_umount(void)
 	if(!mounted){
 		return(-1);
 	}
-	void *buf = malloc(BLOCK_SIZE);
 	for(int i=1; i < superblock.root_index; i++){
 		if(block_write(i, fat + (i-1)*BLOCK_SIZE) == -1){
 			return(-1);
@@ -247,6 +247,7 @@ int fs_delete(const char *filename)
 		fat[current_block] = 0; //marking the current block as free
 		current_block = next_block; //moving on to the next block
 	}
+	return 0;
 }
 
 int fs_ls(void)
@@ -264,34 +265,275 @@ int fs_ls(void)
 	return 0;
 }
 
+typedef struct {
+    int     in_use;          // 0 = free, 1 = open
+    int     root_dir_index;  // index into root_dir[] for this FD
+    size_t  offset;          // current byte offset within the file
+} fs_fd_entry_t;
+
+static fs_fd_entry_t fd_table[FS_OPEN_MAX_COUNT];  // phase 3 FD table
+
+
 int fs_open(const char *filename)
 {
-	/* TODO: Phase 3 */
+    if (!mounted || filename == NULL) {
+        return -1;
+    }
+
+    // find the root_dir entry for this filename
+    int dir_idx = -1;
+    for (int i = 0; i < FS_FILE_MAX_COUNT; i++) {
+        if (root_dir[i].filename[0] != '\0' &&
+            strcmp(root_dir[i].filename, filename) == 0) {
+            dir_idx = i;
+            break;
+        }
+    }
+    if (dir_idx < 0) {
+        return -1;  // file not found
+    }
+
+    // find a free slot in fd_table[]
+    int fd = -1;
+    for (int i = 0; i < FS_OPEN_MAX_COUNT; i++) {
+        if (!fd_table[i].in_use) {
+            fd = i;
+            break;
+        }
+    }
+    if (fd < 0) {
+        return -1;  // no available file descriptors
+    }
+
+    // initialize that slot
+    fd_table[fd].in_use         = 1;
+    fd_table[fd].root_dir_index = dir_idx;
+    fd_table[fd].offset         = 0;
+
+    return fd;
 }
 
 int fs_close(int fd)
 {
-	/* TODO: Phase 3 */
+    if (!mounted) {
+        return -1;
+    }
+    if (fd < 0 || fd >= FS_OPEN_MAX_COUNT) {
+        return -1;
+    }
+    if (!fd_table[fd].in_use) {
+        return -1;
+    }
+
+    // mark descriptor free
+    fd_table[fd].in_use         = 0;
+    fd_table[fd].root_dir_index = -1;
+    fd_table[fd].offset         = 0;
+    return 0;
 }
 
 int fs_stat(int fd)
 {
-	/* TODO: Phase 3 */
+    if (!mounted) {
+        return -1;
+    }
+    if (fd < 0 || fd >= FS_OPEN_MAX_COUNT) {
+        return -1;
+    }
+    if (!fd_table[fd].in_use) {
+        return -1;
+    }
+
+    int rindex = fd_table[fd].root_dir_index;
+    return (int)root_dir[rindex].size;
 }
 
 int fs_lseek(int fd, size_t offset)
 {
-	/* TODO: Phase 3 */
+    if (!mounted) {
+        return -1;
+    }
+    if (fd < 0 || fd >= FS_OPEN_MAX_COUNT) {
+        return -1;
+    }
+    if (!fd_table[fd].in_use) {
+        return -1;
+    }
+
+    int rindex    = fd_table[fd].root_dir_index;
+    size_t fsize  = root_dir[rindex].size;
+    if (offset > fsize) {
+        return -1;  // cannot seek past EOF
+    }
+    fd_table[fd].offset = offset;
+    return 0;
 }
+
+
 
 int fs_write(int fd, void *buf, size_t count)
 {
-	/* TODO: Phase 4 */
+    if (!mounted || buf == NULL) {
+        return -1;
+    }
+    if (fd < 0 || fd >= FS_OPEN_MAX_COUNT || !fd_table[fd].in_use) {
+        return -1;
+    }
+
+    int    rindex     = fd_table[fd].root_dir_index;
+    size_t old_size   = root_dir[rindex].size;
+    size_t old_offset = fd_table[fd].offset;
+    if (old_offset > old_size) {
+        return -1;
+    }
+
+    // compute new file size
+    size_t end_pos  = old_offset + count;
+    size_t new_size = (end_pos > old_size) ? end_pos : old_size;
+
+    // count currently allocated blocks
+    uint16_t head = root_dir[rindex].first_block_index;
+    int current_blocks = 0;
+    if (head != FAT_EOC) {
+        uint16_t cur = head;
+        while (cur != FAT_EOC) {
+            current_blocks++;
+            cur = fat[cur];
+        }
+    }
+
+    // how many blocks the new size requires
+    int required_blocks = (new_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    if (required_blocks > current_blocks) {
+        int to_alloc = required_blocks - current_blocks;
+        // find last block of existing chain
+        uint16_t last_idx = FAT_EOC;
+        if (head != FAT_EOC) {
+            last_idx = head;
+            while (fat[last_idx] != FAT_EOC) {
+                last_idx = fat[last_idx];
+            }
+        }
+        // allocate new blocks
+        for (int i = 0; i < to_alloc; i++) {
+            int free_idx = -1;
+            for (int j = 0; j < superblock.data_block_amount; j++) {
+                if (fat[j] == 0) {
+                    free_idx = j;
+                    break;
+                }
+            }
+            if (free_idx < 0) {
+                return -1;  // no free blocks
+            }
+            fat[free_idx] = FAT_EOC;
+            if (head == FAT_EOC) {
+                // first block in chain
+                root_dir[rindex].first_block_index = free_idx;
+                head = free_idx;
+            } else {
+                fat[last_idx] = free_idx;
+            }
+            last_idx = free_idx;
+        }
+    }
+
+    // wqrite data block by block
+    size_t remaining = count;
+    uint8_t *write_ptr = (uint8_t *)buf;
+    size_t pos = old_offset;
+    uint8_t block_data[BLOCK_SIZE];
+
+    while (remaining > 0) {
+        int block_idx_in_chain = pos / BLOCK_SIZE;
+        int block_offset       = pos % BLOCK_SIZE;
+
+        // traverse FAT to find the block index
+        uint16_t cur = root_dir[rindex].first_block_index;
+        for (int i = 0; i < block_idx_in_chain; i++) {
+            cur = fat[cur];
+        }
+        uint16_t fat_idx    = cur;
+        uint16_t disk_block = superblock.data_block_index + fat_idx;
+
+        // read the existing block (for read–modify–write)
+        if (block_read(disk_block, block_data) == -1) {
+            return -1;
+        }
+
+        int chunk = BLOCK_SIZE - block_offset;
+        if ((size_t)chunk > remaining) {
+            chunk = remaining;
+        }
+        memcpy(block_data + block_offset, write_ptr, chunk);
+
+        if (block_write(disk_block, block_data) == -1) {
+            return -1;
+        }
+
+        remaining -= chunk;
+        write_ptr  += chunk;
+        pos        += chunk;
+    }
+
+    // update size and offset
+    root_dir[rindex].size      = new_size;
+    fd_table[fd].offset        = old_offset + count;
+    return (int)count;
 }
 
 int fs_read(int fd, void *buf, size_t count)
 {
-	/* TODO: Phase 4 */
+    if (!mounted || buf == NULL) {
+        return -1;
+    }
+    if (fd < 0 || fd >= FS_OPEN_MAX_COUNT || !fd_table[fd].in_use) {
+        return -1;
+    }
+
+    int    rindex     = fd_table[fd].root_dir_index;
+    size_t file_size  = root_dir[rindex].size;
+    size_t old_offset = fd_table[fd].offset;
+    if (old_offset >= file_size) {
+        return 0;  // EOF
+    }
+
+    size_t max_can_read  = file_size - old_offset;
+    size_t bytes_to_read = (count < max_can_read) ? count : max_can_read;
+
+    size_t remaining = bytes_to_read;
+    uint8_t *read_ptr = (uint8_t *)buf;
+    size_t pos = old_offset;
+    uint8_t block_data[BLOCK_SIZE];
+
+    while (remaining > 0) {
+        int block_idx_in_chain = pos / BLOCK_SIZE;
+        int block_offset       = pos % BLOCK_SIZE;
+
+        uint16_t cur     = root_dir[rindex].first_block_index;
+        for (int i = 0; i < block_idx_in_chain; i++) {
+            cur = fat[cur];
+        }
+        uint16_t fat_idx    = cur;
+        uint16_t disk_block = superblock.data_block_index + fat_idx;
+
+        if (block_read(disk_block, block_data) == -1) {
+            return -1;
+        }
+
+        int chunk = BLOCK_SIZE - block_offset;
+        if ((size_t)chunk > remaining) {
+            chunk = remaining;
+        }
+        memcpy(read_ptr, block_data + block_offset, chunk);
+
+        remaining -= chunk;
+        read_ptr   += chunk;
+        pos        += chunk;
+    }
+
+    fd_table[fd].offset = old_offset + bytes_to_read;
+    return (int)bytes_to_read;
 }
 
 

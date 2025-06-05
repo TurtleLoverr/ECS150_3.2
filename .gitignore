@@ -1,0 +1,12 @@
+# ignore object files and binaries
+*.o
+*.x
+libfs/libfs.a
+apps/*.o
+apps/*.x
+
+# macOS and editor cruft
+.DS_Store
+*.swp
+
+
