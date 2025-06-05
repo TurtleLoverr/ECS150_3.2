@@ -31,6 +31,7 @@ typedef struct root_dir_tag{ //struct for each entry in root directory
 static superblock_t superblock;
 static root_dir_entry_t *root_dir = NULL; 
 static uint16_t *fat = NULL;
+static uint8_t mounted = 0;
 
 /* TODO: Phase 1 */
 
@@ -122,6 +123,7 @@ int fs_mount(const char *diskname)
 		root_dir = NULL;
 		return(-1);
 	}
+	mounted = 1;
 
 
 	return 0;
@@ -130,6 +132,18 @@ int fs_mount(const char *diskname)
 int fs_umount(void)
 {
 	/* TODO: Phase 1 */
+	if(!mounted){
+		return(-1);
+	}
+	void *buf = malloc(BLOCK_SIZE);
+	for(int i=1; i < superblock.root_index; i++){
+		if(block_write(i, fat + (i-1)*BLOCK_SIZE) == -1){
+			return(-1);
+		}
+	}
+	if(block_write(superblock.root_index, root_dir) == -1){
+		return(-1);
+	}
 	free(fat);
 	free(root_dir);
 	fat = NULL; 
@@ -143,7 +157,7 @@ int fs_umount(void)
 int fs_info(void)
 {
 	/* TODO: Phase 1 */
-	if(fat == NULL){
+	if(!mounted){
 		return(-1);
 	}
 	int fat_free_blocks = 0; //counting how many blocks are available
@@ -175,16 +189,79 @@ int fs_info(void)
 int fs_create(const char *filename)
 {
 	/* TODO: Phase 2 */
+	if(!mounted){
+		return(-1);
+	}
+	if(filename == NULL){
+		return(-1);
+	}
+	if(strlen(filename)>= FS_FILENAME_LEN){
+		return(-1);
+	}
+	int empty_entry_idx = -1;
+	for(int i=0; i < FS_FILE_MAX_COUNT; i++){
+		if(strcmp(root_dir[i].filename, filename) == 0){ //checking if file already exists
+			return(-1); //return -1 if it does
+		}
+		if(empty_entry_idx == -1 && root_dir[i].filename[0] == '\0'){ //if next empty index isn't found yet, we check the current root directory entry
+			empty_entry_idx = i;
+		}
+	}
+	if(empty_entry_idx == -1){ //root directory is full(no empty entry)
+		return(-1);
+	}
+	strcpy(root_dir[empty_entry_idx].filename, filename);
+	root_dir[empty_entry_idx].size = 0;
+	root_dir[empty_entry_idx].first_block_index = FAT_EOC;
+
+	return 0;
 }
 
 int fs_delete(const char *filename)
 {
 	/* TODO: Phase 2 */
+	if(!mounted){ //checking if we have a file system actually mounted 
+		return(-1);
+	}
+	if(!filename){ 
+		return(-1);
+	}
+	if(strlen(filename) == 0 || strlen(filename) >= FS_FILENAME_LEN){ //checking that the filename isn't empty or too long(cuz we have a limit)
+		return(-1);
+	}
+
+	int file_idx = -1; //now we have to actually find the file in our root directory 
+	for(int i = 0; i < FS_FILE_MAX_COUNT; i++){ 
+		if(strcmp(root_dir[i].filename, filename) == 0){ //it was found
+			file_idx = i;
+			break;
+		}
+	}
+	if(file_idx == -1){  //if we can't find the file
+		return(-1); 
+	}
+	
+	uint16_t current_block = root_dir[file_idx].first_block_index; //now we have to free all the blocks this file was using
+	while(current_block != FAT_EOC){
+		uint16_t next_block = fat[current_block];
+		fat[current_block] = 0; //marking the current block as free
+		current_block = next_block; //moving on to the next block
+	}
 }
 
 int fs_ls(void)
 {
 	/* TODO: Phase 2 */
+	if(!mounted){
+		return(-1);
+	}
+	printf("FS LS:\n");
+	for(int i=0; i < FS_FILE_MAX_COUNT; i++){
+		if(root_dir[i].filename[0] != '\0'){
+			printf("file: %s, size: %u, data_blk: %u\n", root_dir[i].filename, root_dir[i].size, root_dir[i].first_block_index);
+		}
+	}
+	return 0;
 }
 
 int fs_open(const char *filename)
