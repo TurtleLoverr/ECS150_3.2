@@ -33,6 +33,14 @@ static root_dir_entry_t *root_dir = NULL;
 static uint16_t *fat = NULL;
 static uint8_t mounted = 0;
 
+typedef struct {
+    int     in_use;          // 0 = free, 1 = open
+    int     root_dir_index;  // index into root_dir[] for this FD
+    size_t  offset;          // current byte offset within the file
+} fs_fd_entry_t;
+
+static fs_fd_entry_t fd_table[FS_OPEN_MAX_COUNT];
+
 /* TODO: Phase 1 */
 
 int fs_mount(const char *diskname)
@@ -95,8 +103,6 @@ int fs_mount(const char *diskname)
 			fat = NULL; 
 			return(-1);
 		}
-
-	
 	}
 
 	memcpy(fat, fat_buffer, superblock.data_block_amount * sizeof(uint16_t)); //copy the FAT data from the temporary buffer into the actual FAT
@@ -122,13 +128,19 @@ int fs_mount(const char *diskname)
 		free(root_dir);
 		root_dir = NULL;
 		return(-1);
-
 	}
+
+    //  initialize FD table: all descriptors start closed 
+    for (int i = 0; i < FS_OPEN_MAX_COUNT; i++) {
+        fd_table[i].in_use         = 0;
+        fd_table[i].root_dir_index = -1;
+        fd_table[i].offset         = 0;
+    }
+
 	mounted = 1;
-
-
 	return 0;
 }
+
 
 int fs_umount(void)
 {
@@ -240,6 +252,13 @@ int fs_delete(const char *filename)
 	if(file_idx == -1){  //if we can't find the file
 		return(-1); 
 	}
+
+    // refuse to delete if this file is currently open 
+    for (int i = 0; i < FS_OPEN_MAX_COUNT; i++) {
+        if (fd_table[i].in_use && fd_table[i].root_dir_index == file_idx) {
+            return -1;
+        }
+    }
 	
 	uint16_t current_block = root_dir[file_idx].first_block_index; //now we have to free all the blocks this file was using
 	while(current_block != FAT_EOC){
@@ -247,6 +266,12 @@ int fs_delete(const char *filename)
 		fat[current_block] = 0; //marking the current block as free
 		current_block = next_block; //moving on to the next block
 	}
+
+    // Also clear the directory entry
+    root_dir[file_idx].filename[0]    = '\0';
+    root_dir[file_idx].size           = 0;
+    root_dir[file_idx].first_block_index = FAT_EOC;
+
 	return 0;
 }
 
@@ -265,13 +290,6 @@ int fs_ls(void)
 	return 0;
 }
 
-typedef struct {
-    int     in_use;          // 0 = free, 1 = open
-    int     root_dir_index;  // index into root_dir[] for this FD
-    size_t  offset;          // current byte offset within the file
-} fs_fd_entry_t;
-
-static fs_fd_entry_t fd_table[FS_OPEN_MAX_COUNT];  // phase 3 FD table
 
 
 int fs_open(const char *filename)
@@ -491,7 +509,7 @@ int fs_read(int fd, void *buf, size_t count)
         return -1;
     }
 
-    int    rindex     = fd_table[fd].root_dir_index;
+    int rindex = fd_table[fd].root_dir_index;
     size_t file_size  = root_dir[rindex].size;
     size_t old_offset = fd_table[fd].offset;
     if (old_offset >= file_size) {
