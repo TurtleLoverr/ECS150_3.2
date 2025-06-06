@@ -267,7 +267,7 @@ int fs_delete(const char *filename)
 		current_block = next_block; //moving on to the next block
 	}
 
-    // Also clear the directory entry
+    // also clear the directory entry
     root_dir[file_idx].filename[0]    = '\0';
     root_dir[file_idx].size           = 0;
     root_dir[file_idx].first_block_index = FAT_EOC;
@@ -294,6 +294,7 @@ int fs_ls(void)
 
 int fs_open(const char *filename)
 {
+	// reject if no file system is mounted of if filename is NULL
     if (!mounted || filename == NULL) {
         return -1;
     }
@@ -301,12 +302,14 @@ int fs_open(const char *filename)
     // find the root_dir entry for this filename
     int dir_idx = -1;
     for (int i = 0; i < FS_FILE_MAX_COUNT; i++) {
+		// check non-empty slot and compare strings
         if (root_dir[i].filename[0] != '\0' &&
             strcmp(root_dir[i].filename, filename) == 0) {
             dir_idx = i;
             break;
         }
     }
+	// if not found then return error
     if (dir_idx < 0) {
         return -1;  // file not found
     }
@@ -323,19 +326,21 @@ int fs_open(const char *filename)
         return -1;  // no available file descriptors
     }
 
-    // initialize that slot
-    fd_table[fd].in_use         = 1;
-    fd_table[fd].root_dir_index = dir_idx;
-    fd_table[fd].offset         = 0;
+    
+    fd_table[fd].in_use         = 1; // mark slot in use
+    fd_table[fd].root_dir_index = dir_idx; // remember which root directory entry it refers to
+    fd_table[fd].offset         = 0; // set file offest to beginning of file
 
     return fd;
 }
 
 int fs_close(int fd)
 {
+	// reject if no FS is mounted
     if (!mounted) {
         return -1;
     }
+	// reject invalid descriptor values
     if (fd < 0 || fd >= FS_OPEN_MAX_COUNT) {
         return -1;
     }
@@ -343,7 +348,7 @@ int fs_close(int fd)
         return -1;
     }
 
-    // mark descriptor free
+    // mark descriptor free again
     fd_table[fd].in_use         = 0;
     fd_table[fd].root_dir_index = -1;
     fd_table[fd].offset         = 0;
@@ -361,9 +366,9 @@ int fs_stat(int fd)
     if (!fd_table[fd].in_use) {
         return -1;
     }
-
+	// look up which root directory entry this fd points to
     int rindex = fd_table[fd].root_dir_index;
-    return (int)root_dir[rindex].size;
+    return (int)root_dir[rindex].size; // return the file's current size
 }
 
 int fs_lseek(int fd, size_t offset)
@@ -377,7 +382,7 @@ int fs_lseek(int fd, size_t offset)
     if (!fd_table[fd].in_use) {
         return -1;
     }
-
+	// get the file's root directory index
     int rindex    = fd_table[fd].root_dir_index;
     size_t fsize  = root_dir[rindex].size;
     if (offset > fsize) {
@@ -399,9 +404,9 @@ int fs_write(int fd, void *buf, size_t count)
     }
 
     int    rindex     = fd_table[fd].root_dir_index;
-    size_t old_size   = root_dir[rindex].size;
-    size_t old_offset = fd_table[fd].offset;
-    if (old_offset > old_size) {
+    size_t old_size   = root_dir[rindex].size; // current file size
+    size_t old_offset = fd_table[fd].offset; // current file offset
+    if (old_offset > old_size) { // cant write if offset is larger than current size
         return -1;
     }
 
@@ -420,9 +425,10 @@ int fs_write(int fd, void *buf, size_t count)
         }
     }
 
-    // how many blocks the new size requires
+    // how many blocks the new size needs
     int required_blocks = (new_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
     if (required_blocks > current_blocks) {
+		// we need to allocate "requried_blocks - current_blocks" to get the number of new blocks
         int to_alloc = required_blocks - current_blocks;
         // find last block of existing chain
         uint16_t last_idx = FAT_EOC;
@@ -432,18 +438,22 @@ int fs_write(int fd, void *buf, size_t count)
                 last_idx = fat[last_idx];
             }
         }
-        // allocate new blocks
+        // allocate new blocks one by one
         for (int i = 0; i < to_alloc; i++) {
             int free_idx = -1;
+
+			// search FAT for a free block value == 0
             for (int j = 0; j < superblock.data_block_amount; j++) {
-                if (fat[j] == 0) {
+                if (fat[j] == 0) { 
                     free_idx = j;
                     break;
                 }
             }
+			// no free blocks
             if (free_idx < 0) {
                 return -1;  // no free blocks
             }
+			// mark this block as the end of chain
             fat[free_idx] = FAT_EOC;
             if (head == FAT_EOC) {
                 // first block in chain
@@ -456,13 +466,14 @@ int fs_write(int fd, void *buf, size_t count)
         }
     }
 
-    // wqrite data block by block
+    // wqrite data block by block - read-modify-write loop
     size_t remaining = count;
     uint8_t *write_ptr = (uint8_t *)buf;
     size_t pos = old_offset;
     uint8_t block_data[BLOCK_SIZE];
 
     while (remaining > 0) {
+		// determine which FAT chain index corresponds to pos
         int block_idx_in_chain = pos / BLOCK_SIZE;
         int block_offset       = pos % BLOCK_SIZE;
 
@@ -478,23 +489,27 @@ int fs_write(int fd, void *buf, size_t count)
         if (block_read(disk_block, block_data) == -1) {
             return -1;
         }
-
+		// compute how many bytes to copy in this block
         int chunk = BLOCK_SIZE - block_offset;
         if ((size_t)chunk > remaining) {
             chunk = remaining;
         }
+
+		// copy from user buffer into the block buffer
         memcpy(block_data + block_offset, write_ptr, chunk);
 
+		// write the updated block back to the disk
         if (block_write(disk_block, block_data) == -1) {
             return -1;
         }
 
+		// advance the pointers and counters!
         remaining -= chunk;
         write_ptr  += chunk;
         pos        += chunk;
     }
 
-    // update size and offset
+    // update the file's metadata with the new size and new offset
     root_dir[rindex].size      = new_size;
     fd_table[fd].offset        = old_offset + count;
     return (int)count;
@@ -515,7 +530,7 @@ int fs_read(int fd, void *buf, size_t count)
     if (old_offset >= file_size) {
         return 0;  // EOF
     }
-
+	// determine how many bytes we actually read
     size_t max_can_read  = file_size - old_offset;
     size_t bytes_to_read = (count < max_can_read) ? count : max_can_read;
 
@@ -525,9 +540,11 @@ int fs_read(int fd, void *buf, size_t count)
     uint8_t block_data[BLOCK_SIZE];
 
     while (remaining > 0) {
+		// determine which block in the FAT chain contains pos
         int block_idx_in_chain = pos / BLOCK_SIZE;
         int block_offset       = pos % BLOCK_SIZE;
 
+		// traverse FAT to get to the correct block-index in chain
         uint16_t cur     = root_dir[rindex].first_block_index;
         for (int i = 0; i < block_idx_in_chain; i++) {
             cur = fat[cur];
@@ -535,21 +552,24 @@ int fs_read(int fd, void *buf, size_t count)
         uint16_t fat_idx    = cur;
         uint16_t disk_block = superblock.data_block_index + fat_idx;
 
+		// read that block from disk
         if (block_read(disk_block, block_data) == -1) {
             return -1;
         }
-
+		
+		// compute how many bytes to copy out of this block
         int chunk = BLOCK_SIZE - block_offset;
         if ((size_t)chunk > remaining) {
             chunk = remaining;
         }
+		// copy from block buffer into user buffer
         memcpy(read_ptr, block_data + block_offset, chunk);
 
         remaining -= chunk;
         read_ptr   += chunk;
         pos        += chunk;
     }
-
+	// update the file offset by how many bytes we actually read
     fd_table[fd].offset = old_offset + bytes_to_read;
     return (int)bytes_to_read;
 }
